@@ -6,6 +6,8 @@ Usage:
 """
 import argparse
 import json
+import time
+from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -19,6 +21,20 @@ PAGE_SIZE = 5000  # EIA v2 maximum rows per request
 
 
 # ---------------------------------------------------------------- EIA mode
+def get_json_with_retry(url: str, attempts: int = 4) -> dict:
+    """GET a JSON page, retrying with backoff: the EIA API often times out or 5xx's."""
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(url, timeout=90) as resp:
+                return json.load(resp)
+        except (TimeoutError, URLError) as e:   # HTTPError is a subclass of URLError
+            if attempt == attempts or getattr(e, "code", 500) < 500:   # don't retry 4xx (bad key etc.)
+                raise
+            wait = 5 * attempt
+            print(f"  EIA request failed ({e}); retrying in {wait}s...")
+            time.sleep(wait)
+
+
 def fetch_eia(days: int, region: str = REGION) -> pd.DataFrame:
     """Download hourly generation by fuel type, following EIA's offset pagination."""
     if not EIA_API_KEY:
@@ -41,8 +57,7 @@ def fetch_eia(days: int, region: str = REGION) -> pd.DataFrame:
     rows, offset = [], 0
     while True:
         url = EIA_URL + "?" + urlencode(params + [("offset", offset)])
-        with urlopen(url, timeout=60) as resp:
-            payload = json.load(resp)
+        payload = get_json_with_retry(url)
         if "response" not in payload:
             raise RuntimeError(f"EIA API error: {payload}")
         page = payload["response"]["data"]
@@ -138,12 +153,17 @@ def synthetic_readings(days: int = 120, region: str = REGION, end=None, seed: in
 
 
 # ---------------------------------------------------------------- loading
-def load(df: pd.DataFrame) -> None:
+def load(df: pd.DataFrame, replace: bool = False) -> None:
     """Bulk-load with COPY into a temp table, then upsert into the hypertable
-    (so re-running ingest never creates duplicates)."""
+    (so re-running ingest never creates duplicates). With replace=True the region's
+    existing rows are deleted first, so data from different sources never mixes."""
     rows = zip((t.to_pydatetime() for t in df["time"]), df["region"], df["fuel"],
                df["mwh"].astype(float), df["co2_kg"].astype(float))
     with get_conn() as conn, conn.cursor() as cur:
+        if replace:
+            # Same transaction as the load: if anything fails, the old data is kept
+            cur.execute("DELETE FROM grid_readings WHERE region = ANY(%s)", (list(df["region"].unique()),))
+            print(f"Deleted {cur.rowcount} existing rows for {', '.join(df['region'].unique())}")
         cur.execute("CREATE TEMP TABLE staging (LIKE grid_readings) ON COMMIT DROP")
         with cur.copy("COPY staging (time, region, fuel, mwh, co2_kg) FROM STDIN") as copy:
             for row in rows:
@@ -177,6 +197,9 @@ def main():
     parser.add_argument("mode", choices=["eia", "synthetic"])
     parser.add_argument("--days", type=int, default=None, help="history to load (default 90 eia / 120 synthetic)")
     parser.add_argument("--region", default=REGION)
+    parser.add_argument("--replace", action="store_true",
+                        help="delete the region's existing rows first (e.g. switching synthetic -> eia), "
+                             "so the two sources never mix")
     args = parser.parse_args()
 
     if args.mode == "eia":
@@ -187,7 +210,7 @@ def main():
         df = synthetic_readings(args.days or 120, args.region)
     print(f"{len(df)} rows, {df['time'].min()} -> {df['time'].max()}")
 
-    load(df)
+    load(df, replace=args.replace)
     refresh_and_compress()
 
 
